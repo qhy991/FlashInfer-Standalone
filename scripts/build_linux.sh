@@ -33,7 +33,7 @@ else
     echo "Using specified architecture: $CUDA_ARCH"
 fi
 
-CXX_FLAGS="-O3 -std=c++17"
+CXX_FLAGS="-O2 -std=c++17"
 NVCC_FLAGS="-arch=$CUDA_ARCH $CXX_FLAGS"
 
 echo "Compiler flags: $NVCC_FLAGS"
@@ -88,6 +88,17 @@ if [ $? -ne 0 ]; then
     exit 1
 fi
 
+# Build GQA Decode standalone version
+echo "Building GQA Decode standalone version..."
+nvcc $NVCC_FLAGS \
+    src/gqa_decode_sm89_standalone.cu \
+    -o build/gqa_decode_sm89_standalone
+
+if [ $? -ne 0 ]; then
+    echo "Build failed!"
+    exit 1
+fi
+
 echo ""
 echo "========================================"
 echo "Build successful!"
@@ -98,10 +109,13 @@ echo "  - build/fp8_gemm_sm89_standalone (test version)"
 echo "  - build/fp8_gemm_benchmark (benchmark version)"
 echo "  - build/silu_and_mul_sm89_standalone (SiLU_and_Mul)"
 echo "  - build/rmsnorm_sm89_standalone (RMSNorm)"
+echo "  - build/gqa_decode_sm89_standalone (GQA Decode)"
 echo ""
 echo "To run:"
 echo "  ./build/fp8_gemm_sm89_standalone        # Basic FP8 GEMM test"
 echo "  ./build/fp8_gemm_benchmark               # FP8 GEMM benchmark"
 echo "  ./build/silu_and_mul_sm89_standalone     # SiLU_and_Mul test"
 echo "  ./build/rmsnorm_sm89_standalone          # RMSNorm test"
+echo "  ./build/gqa_decode_sm89_standalone      # GQA Decode test"
+echo "  ./build/gqa_decode_sm89_standalone paged # GQA Decode with paged KV cache"
 echo ""

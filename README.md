@@ -13,6 +13,7 @@
 | **FP8 GEMM** | FP8 (e4m3) | FP32 累加 | 使用 cuBLASLt Tensor Core |
 | **SiLU_and_Mul** | FP16/BF16 | FP32 | 融合激活操作 |
 | **RMSNorm** | FP16/BF16 | FP32 | 归一化操作 |
+| **GQA Decode** | FP16/BF16 | FP32 | 分组查询注意力 + Paged KV Cache |
 
 **为什么有些算子使用 FP8，有些不使用？**
 
@@ -31,7 +32,8 @@ FlashInfer-Standalone/
 │   ├── fp8_gemm_benchmark.cu         # FP8 GEMM 性能测试版本
 │   ├── silu_and_mul_sm89_standalone.cu  # SiLU_and_Mul standalone 实现
 │   ├── silu_and_mul_debug.cu         # SiLU_and_Mul 调试版本
-│   └── rmsnorm_sm89_standalone.cu    # RMSNorm standalone 实现 (新增)
+│   ├── rmsnorm_sm89_standalone.cu    # RMSNorm standalone 实现
+│   └── gqa_decode_sm89_standalone.cu  # GQA Decode standalone 实现 (新增)
 ├── scripts/
 │   ├── build_windows.bat             # Windows 编译脚本
 │   ├── build_linux.sh                # Linux 编译脚本
@@ -40,12 +42,15 @@ FlashInfer-Standalone/
 │   ├── benchmark_silu_and_mul_compare.py  # SiLU_and_Mul 性能对比
 │   └── benchmark_rmsnorm_compare.py  # RMSNorm 性能对比 (新增)
 └── docs/
-    ├── FlashInfer调用链分析.md        # FP8 GEMM 完整调用链文档
-    ├── SiLU_and_Mul调用链分析.md      # SiLU_and_Mul 调用链分析
-    ├── RMSNorm调用链分析.md           # RMSNorm 调用链分析 (新增)
-    ├── Standalone实现说明.md          # Standalone 实现详细说明
-    ├── 性能对比分析.md                # FP8 GEMM 性能对比分析
-    └── FP8零输出问题分析.md           # FP8 零输出问题根因分析
+    ├── FlashInfer调用链分析.md            # FP8 GEMM 完整调用链文档
+    ├── FlashInfer_Attention调用链分析.md  # Attention 算子完整调用链
+    ├── Attention算子实现可行性分析.md     # GQA/Ragged/MLA/XQA 可行性分析
+    ├── GQA_Decode调用链分析.md            # GQA Decode 调用链分析 (新增)
+    ├── SiLU_and_Mul调用链分析.md          # SiLU_and_Mul 调用链分析
+    ├── RMSNorm调用链分析.md               # RMSNorm 调用链分析
+    ├── Standalone实现说明.md              # Standalone 实现详细说明
+    ├── 性能对比分析.md                    # FP8 GEMM 性能对比分析
+    └── FP8零输出问题分析.md               # FP8 零输出问题根因分析
 ```
 
 ## 快速开始
@@ -435,6 +440,81 @@ First 8 output values (row 0):
 1. **向量化内存访问**: 16 字节对齐加载/存储
 2. **Block-level reduction**: Warp shuffle + shared memory 两级 reduction
 3. **Shared memory 广播**: RMS 值广播到所有线程
+
+---
+
+## Attention 算子实现可行性分析
+
+### 概述
+
+基于对 FlashInfer 的深入分析，我们评估了在 **SM89 (RTX 4090)** 架构上实现以下实用 Attention 算子的可行性。
+
+详细的可行性分析请参考：[`docs/Attention算子实现可行性分析.md`](docs/Attention算子实现可行性分析.md)
+
+### SM89 (RTX 4090) 推荐实现优先级
+
+| 优先级 | 算子 | 复杂度 | 说明 | 预计工作量 |
+|--------|------|--------|------|-----------|
+| **⭐⭐⭐⭐⭐** | GQA Decode with Paged KV Cache | 中等 | 分组查询注意力 + 分页 KV 缓存，核心推理操作 | 2-3 周 |
+| **⭐⭐⭐⭐** | Ragged Prefill Attention | 中高 | 变长序列批处理，无填充 | 2-3 周 |
+| **⭐⭐⭐** | MLA (FA2 Backend) | 高 | DeepSeek V2/V3 多头潜在注意力，需 CUTLASS CuTe DSL | 3-4 周 |
+| ❌ | XQA (Cross-Query Attention) | 极高 | **SM89 不支持**，需要 SM90+ (Hopper) | 不适用 |
+
+### 关键发现
+
+1. **GQA Decode** - 最佳起点：
+   - ✅ 完整的 SM89 tensor core 支持
+   - ✅ 清晰的 Plan/Run 架构模式
+   - ✅ 标准 3D 张量布局
+   - 实用价值高（LLM 推理核心操作）
+
+2. **Ragged Prefill** - 可行但更复杂：
+   - ✅ 完整的 SM89 FA2 支持
+   - ⚠️ 最大的单一内核文件（125KB）
+   - FlashAttention-2 tiling 策略
+
+3. **MLA (FA2)** - 具挑战性：
+   - ✅ SM89 通过 CUTLASS CuTe 支持
+   - ❌ 需要 2D KV cache 布局（非标准）
+   - ❌ DeepSeek 特定约束（128:1 头比例）
+   - 需要学习 CUTLASS CuTe DSL
+
+4. **XQA** - SM89 不适用：
+   - ❌ 需要 SM90+ 硬件特性（GMMA/WGMMA, PDL/TMA）
+   - ❌ 无回退实现路径
+
+### 架构支持总结
+
+| 算子 | SM89 (RTX 4090) | SM90 (H100) | SM100 (B100) | SM120 (B200) |
+|------|-----------------|-------------|--------------|--------------|
+| **MLA (FA2)** | ✅ 支持 (TC) | ✅ 支持 | ✅ 支持 | ✅ 支持 |
+| **MLA (FA3)** | ❌ 不支持 | ✅ 支持 | ✅ 支持 | ✅ 支持 |
+| **MLA (XQA)** | ❌ **不支持** | ❌ 不支持 | ❌ 不支持 | ✅ 仅 FP8 |
+| **GQA Decode (FA2)** | ✅ **完整** | ✅ 完整 | ✅ 完整 | ✅ 完整 |
+| **Ragged Prefill (FA2)** | ✅ **完整** | ✅ 完整 | ✅ 完整 | ✅ 完整 |
+| **XQA MHA** | ❌ **不支持** | ✅ 支持 | ✅ 支持 | ✅ 支持 |
+
+### 下一步计划
+
+**阶段 1**: GQA Decode with Paged KV Cache（推荐起点）
+- 基本单请求 decode
+- GQA 头分组
+- Split-K 算法
+- 页表遍历
+
+**阶段 2**: Ragged Prefill Attention
+- CSR 间接寻址
+- FlashAttention-2 tiling
+- Online softmax
+
+**阶段 3**: MLA (FA2 Backend)
+- 学习 CUTLASS CuTe DSL
+- 2D KV cache 布局
+- DeepSeek 特定优化
+
+详细信息请参考：[`docs/Attention算子实现可行性分析.md`](docs/Attention算子实现可行性分析.md)
+
+---
 
 ## 常见问题
 
