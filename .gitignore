@@ -1,0 +1,33 @@
+# Build outputs
+build/
+*.o
+*.so
+*.a
+*.exe
+
+# Compiled binaries
+fp8_gemm_benchmark
+fp8_gemm_sm89_standalone
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+.pytest_cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.log
+*.bak
