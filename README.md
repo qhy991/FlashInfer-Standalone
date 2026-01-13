@@ -1,27 +1,51 @@
 # FlashInfer-Standalone
 
-# FlashInfer FP8 GEMM 分析与实现
+# FlashInfer 算子分析与实现
 
 ## 概述
 
-本文件夹包含 FlashInfer FP8 GEMM 的完整分析、standalone 实现和测试脚本，支持 SM89 (Ada Lovelace/RTX 40xx) 和 SM90 (Hopper/H100/H200) 架构。
+本文件夹包含 FlashInfer 多个算子的完整分析、standalone 实现和测试脚本，支持 SM89 (Ada Lovelace/RTX 40xx) 和 SM90 (Hopper/H100/H200) 架构。
+
+### 当前支持的算子
+
+| 算子 | 数据类型 | 计算类型 | 说明 |
+|------|----------|----------|------|
+| **FP8 GEMM** | FP8 (e4m3) | FP32 累加 | 使用 cuBLASLt Tensor Core |
+| **SiLU_and_Mul** | FP16/BF16 | FP32 | 融合激活操作 |
+| **RMSNorm** | FP16/BF16 | FP32 | 归一化操作 |
+
+**为什么有些算子使用 FP8，有些不使用？**
+
+- **FP8 主要用于矩阵乘法 (GEMM)**：GEMM 计算量大（O(N³)），FP8 可以显著减少内存带宽和计算时间
+- **Element-wise 操作通常使用 FP16/BF16**：
+  - 受内存带宽限制而非计算限制
+  - FP8 的精度损失对非线性操作影响更大
+  - FP16/BF16 已经足够快，精度也更好
 
 ## 文件夹结构
 
 ```
 FlashInfer-Standalone/
 ├── src/
-│   ├── fp8_gemm_sm89_standalone.cu  # 基础测试版本
-│   └── fp8_gemm_benchmark.cu        # 性能测试版本
+│   ├── fp8_gemm_sm89_standalone.cu   # FP8 GEMM 基础测试版本
+│   ├── fp8_gemm_benchmark.cu         # FP8 GEMM 性能测试版本
+│   ├── silu_and_mul_sm89_standalone.cu  # SiLU_and_Mul standalone 实现
+│   ├── silu_and_mul_debug.cu         # SiLU_and_Mul 调试版本
+│   └── rmsnorm_sm89_standalone.cu    # RMSNorm standalone 实现 (新增)
 ├── scripts/
-│   ├── build_windows.bat            # Windows 编译脚本
-│   ├── build_linux.sh               # Linux 编译脚本
-│   ├── benchmark_compare.py         # 性能对比脚本
-│   └── benchmark_precise.py         # 精确性能测试脚本 (新增)
+│   ├── build_windows.bat             # Windows 编译脚本
+│   ├── build_linux.sh                # Linux 编译脚本
+│   ├── benchmark_compare.py          # FP8 GEMM 性能对比脚本
+│   ├── benchmark_precise.py          # FP8 GEMM 精确性能测试脚本
+│   ├── benchmark_silu_and_mul_compare.py  # SiLU_and_Mul 性能对比
+│   └── benchmark_rmsnorm_compare.py  # RMSNorm 性能对比 (新增)
 └── docs/
-    ├── FlashInfer调用链分析.md       # FlashInfer FP8 GEMM 完整调用链文档
-    ├── Standalone实现说明.md         # Standalone 实现详细说明
-    └── FP8零输出问题分析.md          # FP8 零输出问题根因分析 (新增)
+    ├── FlashInfer调用链分析.md        # FP8 GEMM 完整调用链文档
+    ├── SiLU_and_Mul调用链分析.md      # SiLU_and_Mul 调用链分析
+    ├── RMSNorm调用链分析.md           # RMSNorm 调用链分析 (新增)
+    ├── Standalone实现说明.md          # Standalone 实现详细说明
+    ├── 性能对比分析.md                # FP8 GEMM 性能对比分析
+    └── FP8零输出问题分析.md           # FP8 零输出问题根因分析
 ```
 
 ## 快速开始
@@ -125,6 +149,33 @@ c_flashinfer = bmm_fp8(a_fp8, b_fp8, scale_a, scale_b, torch.float16)
 - 使用 `scale=1.0`
 - 确保输入数据范围在 FP8 可表示范围内
 
+### 数据类型详解
+
+| 阶段 | 数据类型 | 说明 |
+|------|----------|------|
+| 输入 A | FP8 E4M3 | (batch, m, k) - 权重/激活值 |
+| 输入 B | FP8 E4M3 | (batch, k, n) - 权重/激活值 |
+| Scale A | FP32 | 缩放因子 (通常 1.0) |
+| Scale B | FP32 | 缩放因子 (通常 1.0) |
+| Tensor Core 计算 | FP8 × FP8 → FP32 | 累加器使用 FP32 |
+| Epilogue | FP32 | 应用 scale factors |
+| 输出 C | FP16/BF16 | (batch, m, n) |
+
+**FP8 GEMM 计算流程**:
+```
+1. 输入转换: FP16/BF16 → FP8 E4M3 (预处理)
+2. 加载: FP8 数据加载到 Tensor Core
+3. 计算: FP8 × FP8 → FP32 累加
+4. Epilogue: output = (accumulator × scale_a × scale_b)
+5. 输出: FP32 → FP16/BF16
+```
+
+**为什么 GEMM 使用 FP8？**
+- GEMM 是计算密集型操作 (O(N³))
+- 内存带宽是主要瓶颈
+- FP8 Tensor Core 提供 2x 理论加速
+- 大模型中权重和激活值量化到 FP8 损失可控
+
 ## 性能分析
 
 ### 测试环境
@@ -184,6 +235,207 @@ python3 scripts/benchmark_precise.py
 - 每次运行执行 100 次迭代
 - 输出平均值、标准差和范围
 
+---
+
+## SiLU_and_Mul 融合激活操作
+
+### 概述
+
+SiLU_and_Mul 是 LLaMA 等现代 LLM 模型中常用的融合激活操作，它将 SiLU (Sigmoid Linear Unit) 激活函数与元素乘法融合在一起：
+
+```
+output = SiLU(x) * y
+其中 x = input[..., :hidden_dim]
+     y = input[..., hidden_dim:]
+     SiLU(x) = x / (1 + exp(-x))  (也称为 Swish 激活)
+```
+
+### 数据类型
+
+| 阶段 | 数据类型 | 说明 |
+|------|----------|------|
+| 输入 | FP16/BF16 | 2 × hidden_dim (x 和 y 拼接) |
+| 中间计算 | FP32 | SiLU 激活函数计算 |
+| 输出 | FP16/BF16 | hidden_dim |
+
+**为什么不使用 FP8？**
+- Element-wise 操作受内存带宽限制，FP8 加速不明显
+- SiLU 是非线性激活，FP8 精度损失对结果影响较大
+- FP16/BF16 在这类操作上已经足够快
+
+### 运行测试
+
+```bash
+# 运行 SiLU_and_Mul standalone 测试
+./build/silu_and_mul_sm89_standalone
+
+# 或运行简单版本（标量处理）
+./build/silu_and_mul_sm89_standalone simple
+```
+
+### 预期输出
+
+```
+===============================================================
+SiLU_and_Mul Standalone Implementation Test
+Supports: SM89 (Ada/RTX 40xx) and above
+===============================================================
+
+GPU: NVIDIA GeForce RTX 4090
+Compute Capability: 8.9
+
+===============================================================
+Test: num_tokens=1, hidden_dim=128, version=vectorized
+===============================================================
+
+Performance:
+  Average latency: 0.0028 ms
+  Bandwidth: 0.27 GB/s
+  Throughput: 0.23 GFLOPS
+
+Verification:
+  Result: PASSED
+  Max error: 0.000004
+
+First 8 output values (token 0):
+  [0] x=-1.0000, y=0.0000, expected=-0.0000, actual=-0.0000, error=0.000000
+  [1] x=-0.9922, y=0.0078, expected=-0.0021, actual=-0.0021, error=0.000000
+  ...
+```
+
+### 性能对比
+
+测试环境: NVIDIA RTX 4090 (SM89), CUDA 12.x
+
+| 配置 | FlashInfer | Standalone | 加速比 |
+|------|-----------|------------|--------|
+| Small (128) | 0.0184 ms (0.0 GFLOPS) | 0.0027 ms (0.2 GFLOPS) | **6.81x** |
+| Medium (512) | 0.0118 ms (0.2 GFLOPS) | 0.0027 ms (0.9 GFLOPS) | **4.37x** |
+| Large (2048) | 0.0120 ms (0.9 GFLOPS) | 0.0026 ms (3.9 GFLOPS) | **4.62x** |
+| XLarge (4096) | 0.0116 ms (1.8 GFLOPS) | 0.0026 ms (7.9 GFLOPS) | **4.45x** |
+| Batch4 (2048) | 0.0144 ms (2.9 GFLOPS) | 0.0027 ms (15.2 GFLOPS) | **5.32x** |
+| Batch16 (4096) | 0.0116 ms (28.2 GFLOPS) | 0.0046 ms (71.2 GFLOPS) | **2.52x** |
+
+### 运行性能对比
+
+```bash
+python3 scripts/benchmark_silu_and_mul_compare.py
+```
+
+### Kernel 特性
+
+1. **两个版本**:
+   - **Simple**: 标量处理，易于理解
+   - **Vectorized**: 16 字节向量化加载/存储，更高性能
+
+2. **支持的特性**:
+   - FP16 和 BF16 数据类型
+   - 批处理支持 (任意 batch size)
+   - 任意 hidden_dim (16 字节对齐时最佳性能)
+
+3. **实现细节**:
+   - 每个 token 一个独立的 CUDA block
+   - Block size 根据 hidden_dim 动态调整
+   - 向量化版本使用 `uint4` 进行 16 字节加载/存储
+
+### 性能优化技术
+
+1. **向量化内存访问**: 16 字节对齐加载/存储
+2. **Kernel 融合**: SiLU 激活和乘法在一个 kernel 中完成
+3. **灵活的并行策略**: 每个 token 独立处理，支持任意 batch size
+
+---
+
+## RMSNorm 归一化操作
+
+### 概述
+
+RMSNorm (Root Mean Square Normalization) 是 LLaMA 等 LLM 模型中常用的归一化操作。与 LayerNorm 相比，RMSNorm 不需要中心化（减去均值），计算更简单高效。
+
+**公式**:
+```
+RMS(x) = sqrt(mean(x^2) + eps)
+output = (input / RMS(input)) * weight
+```
+
+### 数据类型
+
+| 阶段 | 数据类型 | 说明 |
+|------|----------|------|
+| 输入 | FP16/BF16 | (batch, hidden_dim) |
+| Weight | FP16/BF16 | (hidden_dim,) |
+| 中间计算 | FP32 | 平方和、开方、除法 |
+| 输出 | FP16/BF16 | (batch, hidden_dim) |
+
+**为什么不使用 FP8？**
+- 归一化操作对数值精度敏感
+- FP8 的有限精度可能导致归一化结果不稳定
+- Reduction 操作在 FP16/BF16 上已经足够高效
+
+### 运行测试
+
+```bash
+# 运行 RMSNorm standalone 测试
+./build/rmsnorm_sm89_standalone
+
+# 或运行简单版本（标量处理）
+./build/rmsnorm_sm89_standalone simple
+```
+
+### 预期输出
+
+```
+===============================================================
+RMSNorm Standalone Implementation Test
+Supports: SM89 (Ada/RTX 40xx) and above
+===============================================================
+
+GPU: NVIDIA GeForce RTX 4090
+Compute Capability: 8.9
+
+===============================================================
+Test: num_rows=1, hidden_dim=2048, version=vectorized
+===============================================================
+
+Performance:
+  Average latency: 0.0028 ms
+  Bandwidth: 4.36 GB/s
+  Throughput: 5.82 GFLOPS
+
+Verification:
+  Result: PASSED
+  Max error: 0.000202
+
+First 8 output values (row 0):
+  [0] in=-1.0000, w=0.5000, expected=-0.8660, actual=-0.8662, error=0.000200
+  [1] in=-0.9922, w=0.5156, expected=-0.8861, actual=-0.8862, error=0.000134
+  ...
+```
+
+### Kernel 特性
+
+1. **两个版本**:
+   - **Simple**: 标量处理，易于理解
+   - **Vectorized**: 16 字节向量化加载/存储，更高性能
+
+2. **支持的特性**:
+   - FP16 和 BF16 数据类型
+   - 批处理支持 (任意 batch size)
+   - 任意 hidden_dim
+
+3. **实现细节**:
+   - 每个 row 一个独立的 CUDA block
+   - Block-level reduction 使用 shared memory
+   - 向量化版本使用 `uint4` 进行 16 字节加载/存储
+   - Warp shuffle 用于 warp 内 reduction
+   - Shared memory 用于跨 warp reduction
+
+### 性能优化技术
+
+1. **向量化内存访问**: 16 字节对齐加载/存储
+2. **Block-level reduction**: Warp shuffle + shared memory 两级 reduction
+3. **Shared memory 广播**: RMS 值广播到所有线程
+
 ## 常见问题
 
 ### Q1: FlashInfer 输出全为 0
@@ -228,6 +480,132 @@ def to_float8(x, dtype=torch.float8_e4m3fn):
 **A**: FP8 (e4m3) 只有 4 位尾数，精度损失是正常的。使用正确的 FP8 转换方法后，与 FP16 参考的误差通常在 1-5% 以内。
 
 ## 核心概念
+
+### 数据类型详解
+
+#### FP8 (Floating Point 8-bit)
+
+FP8 是 NVIDIA 在 H100 (Hopper) 架构中引入的低精度浮点格式，主要有两种变体：
+
+| 格式 | 指数位 | 尾数位 | 表示范围 | 精度 | 典型用途 |
+|------|--------|--------|----------|------|----------|
+| **FP8 E4M3** | 4 | 3 | ±448 (max) | 较高 | 权重、激活值 |
+| **FP8 E5M2** | 5 | 2 | ±57344 (max) | 较低 | 梯度 |
+
+**FlashInfer 中使用 FP8 E4M3** (`torch.float8_e4m3fn`)
+
+**优点**：
+- 内存占用减半 (相比 FP16)
+- Tensor Core 计算速度翻倍
+- 适合大模型推理
+
+**缺点**：
+- 精度有限 (只有 3-4 位尾数)
+- 需要仔细处理缩放因子
+- 数值范围较小
+
+#### FP16 (Half Precision)
+
+16 位半精度浮点数，标准的 IEEE 754 格式。
+
+| 属性 | 值 |
+|------|-----|
+| 指数位 | 5 |
+| 尾数位 | 10 |
+| 表示范围 | ±65504 |
+| 精度 | ~3-4 位十进制 |
+
+**用途**：大多数深度学习推理场景
+
+#### BF16 (Brain Floating Point)
+
+16 位脑浮点格式，由 Google Brain 提出。
+
+| 属性 | 值 |
+|------|-----|
+| 指数位 | 8 |
+| 尾数位 | 7 |
+| 表示范围 | ±3.4e38 (与 FP32 相同) |
+| 精度 | ~2-3 位十进制 |
+
+**用途**：大模型训练和推理（更好的动态范围）
+
+#### 为什么不同算子使用不同数据类型？
+
+| 算子类型 | 为什么使用 FP8 | 为什么使用 FP16/BF16 |
+|----------|----------------|---------------------|
+| **GEMM** | 计算密集型，内存带宽是瓶颈；FP8 Tensor Core 可提供 2x 加速 | 需要更高精度时使用 |
+| **Element-wise (SiLU, Norm)** | 受内存带宽限制，FP8 加速不明显；精度损失对非线性操作影响大 | FP16/BF16 已足够快且精度好 |
+| **Attention** | KV Cache 可以用 FP8 减少内存 | QK 计算通常用 FP16/BF16 |
+| **Quantization** | MxFP8 等格式专门用于压缩 | - |
+
+#### FlashInfer 中的其他 FP8 算子
+
+除了已实现的 FP8 GEMM，FlashInfer 还支持以下 FP8 相关算子：
+
+1. **FP8 KV Cache** (`decode.py`):
+   - 支持 FP8 存储的 KV Cache
+   - 减少 KV Cache 内存占用
+
+2. **MxFP8 Quantization** (`fp8_quantization.py`):
+   - MxFP8 量化格式 (SM100/Blackwell 专用)
+   - 支持分组缩放因子
+   - 输入: FP16/BF16 → 输出: FP8 + scale factors
+
+3. **FP4/NVFP4 量化** (`decode.py`):
+   - 4 位量化，更激进的压缩
+   - 需要 SM100+ 支持
+
+4. **DeepGEMM** (`deep_gemm.py`):
+   - 高性能 FP8 GEMM (SM89/SM90)
+   - 支持分组 GEMM
+   - 来自 DeepSeek 的优化实现
+
+5. **FP8 Attention** (`prefill.py`, `decode.py`):
+   - **FP8 Prefill Attention**: 支持 FP8 Q/K/V 输入 (SM90/H100)
+   - **FP8 KV Cache**: KV Cache 用 FP8 存储，减少内存占用
+   - **FP8 Decode Attention**: decode 阶段支持 FP8 输入
+
+   **数据类型**:
+   ```
+   Q/K/V 输入:  FP8 E4M3
+   Q/K Scale:   FP32 (每个头的缩放因子)
+   V Scale:     FP32 (每个头的缩放因子)
+   QK 计算:     FP8 × FP8 → FP32 (Tensor Core)
+   Softmax:     FP32
+   PV 计算:     FP32 × FP8 → FP32
+   输出:        FP16/BF16
+   ```
+
+   **使用方法**:
+   ```python
+   from flashinfer.prefill import single_prefill_with_kv_cache
+
+   # 准备 FP8 输入
+   q_fp8 = q_fp16.to(torch.float8_e4m3fn)
+   k_fp8 = k_fp16.to(torch.float8_e4m3fn)
+   v_fp8 = v_fp16.to(torch.float8_e4m3fn)
+
+   # 准备缩放因子
+   scale_q = torch.ones(num_heads, dtype=torch.float32, device='cuda')
+   scale_k = torch.ones(num_heads, dtype=torch.float32, device='cuda')
+   scale_v = torch.ones(num_heads, dtype=torch.float32, device='cuda')
+
+   # 运行 FP8 attention
+   output = single_prefill_with_kv_cache(
+       q_fp8, k_fp8, v_fp8,
+       scale_q=scale_q,
+       scale_k=scale_k,
+       scale_v=scale_v
+   )
+   ```
+
+   **架构支持**:
+   | 架构 | FP8 Attention | 后端 |
+   |------|--------------|------|
+   | SM89 (RTX 40xx) | 部分 (FA2) | cuDNN |
+   | SM90 (H100/H200) | 完整 (FA3) | FlashAttention-3 |
+   | SM100+ (Blackwell) | 完整 + MxFP8 | FlashAttention-3 |
 
 ### 架构支持
 

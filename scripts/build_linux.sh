@@ -1,12 +1,12 @@
 #!/bin/bash
-# Build script for FP8 GEMM standalone implementation (Linux)
+# Build script for FlashInfer-Standalone (Linux)
 # Requires: CUDA Toolkit 11.4+ with cuBLASLt support
 # Supports: SM89 (Ada/RTX 40xx), SM90 (Hopper/H100/H200)
 
 set -e  # Exit on error
 
 echo "========================================"
-echo "Building FP8 GEMM Standalone"
+echo "Building FlashInfer-Standalone"
 echo "========================================"
 echo ""
 
@@ -66,6 +66,28 @@ if [ $? -ne 0 ]; then
     exit 1
 fi
 
+# Build SiLU_and_Mul standalone version
+echo "Building SiLU_and_Mul standalone version..."
+nvcc $NVCC_FLAGS \
+    src/silu_and_mul_sm89_standalone.cu \
+    -o build/silu_and_mul_sm89_standalone
+
+if [ $? -ne 0 ]; then
+    echo "Build failed!"
+    exit 1
+fi
+
+# Build RMSNorm standalone version
+echo "Building RMSNorm standalone version..."
+nvcc $NVCC_FLAGS \
+    src/rmsnorm_sm89_standalone.cu \
+    -o build/rmsnorm_sm89_standalone
+
+if [ $? -ne 0 ]; then
+    echo "Build failed!"
+    exit 1
+fi
+
 echo ""
 echo "========================================"
 echo "Build successful!"
@@ -74,8 +96,12 @@ echo ""
 echo "Outputs:"
 echo "  - build/fp8_gemm_sm89_standalone (test version)"
 echo "  - build/fp8_gemm_benchmark (benchmark version)"
+echo "  - build/silu_and_mul_sm89_standalone (SiLU_and_Mul)"
+echo "  - build/rmsnorm_sm89_standalone (RMSNorm)"
 echo ""
 echo "To run:"
-echo "  ./build/fp8_gemm_sm89_standalone   # Basic test"
-echo "  ./build/fp8_gemm_benchmark          # Performance benchmark"
+echo "  ./build/fp8_gemm_sm89_standalone        # Basic FP8 GEMM test"
+echo "  ./build/fp8_gemm_benchmark               # FP8 GEMM benchmark"
+echo "  ./build/silu_and_mul_sm89_standalone     # SiLU_and_Mul test"
+echo "  ./build/rmsnorm_sm89_standalone          # RMSNorm test"
 echo ""
