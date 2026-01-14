@@ -24,6 +24,8 @@
 #include <cstdlib>
 #include <algorithm>
 #include <tuple>
+#include <cstring>
+#include <fstream>
 
 #define CUDA_CHECK(call) \
     do { \
@@ -54,10 +56,13 @@ __device__ __forceinline__ float fp8_e4m3_to_float_raw(uint8_t fp8_bits) {
     }
 
     if (exp == 15) {
-        // Saturated value: exp=15 indicates overflow during quantization
-        // Host uses clamp value of 448, so we return the same here
-        float abs_max = 448.0f;
-        return sign ? -abs_max : abs_max;
+        // exp=15 with mantissa: should be treated as normal value, not always 448
+        // PyTorch/CUDA 12.8 correctly decodes exp=15 with different mantissa values
+        // For example: 0x78 (exp=15, mant=0) = 256.0, not 448.0
+        // So we should decode it like a normal value
+        int new_exp = 15 - 7 + 127;  // = 135
+        unsigned int result_bits = (sign << 31) | (new_exp << 23) | (mant << 20);
+        return __uint_as_float(result_bits);
     }
 
     // FP8 E4M3 exponent bias is 7, FP32 exponent bias is 127
@@ -105,12 +110,12 @@ __device__ __forceinline__ float fp8_to_float(T fp8_val) {
 
 template <typename T>
 __device__ __forceinline__ __nv_fp8_e4m3 float_to_fp8_e4m3(float val) {
-    // Simplified FP8 E4M3 conversion for CUDA 12.2
+    // Use CUDA 12.8's built-in conversion (available since CUDA 12.4)
     // Clamp to FP8 E4M3 range
     if (val > 448.0f) val = 448.0f;
     if (val < -448.0f) val = -448.0f;
 
-    // Use CUDA's built-in conversion if available
+    // Use CUDA's built-in conversion if available (CUDA 12.4+)
     #if defined(__CUDA_ARCH__) && (__CUDACC_VER_MAJOR__ > 12 || (__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ >= 4))
         return __float2_fp8_e4m3(val);
     #else
@@ -161,9 +166,28 @@ __device__ __forceinline__ __nv_fp8_e4m3 float_to_fp8_e4m3(float val) {
 }
 
 // Host-side FP8 E4M3 conversion (for test data preparation)
-// Proper implementation following FP8 E4M3 format specification
-// Returns uint8_t directly to bypass CUDA's built-in __nv_fp8_e4m3 conversion
+// Use CUDA 12.8's built-in conversion when available
+// Note: Since we're now using CUDA 12.8 runtime, we should use the same conversion
+// as PyTorch (which uses CUDA 12.8's FP8 conversion)
 inline uint8_t float_to_fp8_e4m3_host(float val) {
+    // Clamp to FP8 E4M3 range
+    if (val > 448.0f) val = 448.0f;
+    if (val < -448.0f) val = -448.0f;
+
+    // Since we're now using CUDA 12.8 runtime, we should use CUDA 12.8's built-in FP8 conversion
+    // to match PyTorch's .to(float8_e4m3fn) behavior exactly.
+    // 
+    // Note: CUDA 12.8 provides __nv_cvt_float_to_fp8 which can be used, but for host-side
+    // conversion, we need to check if it's available. The device-side __float2_fp8_e4m3
+    // is available in CUDA 12.4+, but host-side may need manual conversion.
+    //
+    // However, since both PyTorch and Standalone now use CUDA 12.8 runtime, the conversion
+    // should be consistent. We keep the manual implementation for now but it should match
+    // PyTorch's behavior when both use CUDA 12.8.
+    //
+    // TODO: Ideally, Standalone should read pre-quantized FP8 data from PyTorch instead of
+    // doing its own conversion, to ensure exact match.
+    
     // Handle special cases
     if (val == 0.0f || fabsf(val) < 1e-9f) {
         return 0;
@@ -1426,84 +1450,93 @@ void test_gqa_decode(
 
         if (use_paged) {
             // Paged version: data layout is [num_pages, num_kv_heads, page_size, head_dim]
+            // Use Per-Tensor scale (same as FlashInfer) for fair comparison
+
+            // Step 1: Find global maximum across all heads
+            float k_max_global = 0.0f;
+            float v_max_global = 0.0f;
+            for (size_t i = 0; i < k_size; ++i) {
+                k_max_global = fmax(k_max_global, fabsf(h_k_float[i]));
+            }
+            for (size_t i = 0; i < v_size; ++i) {
+                v_max_global = fmax(v_max_global, fabsf(h_v_float[i]));
+            }
+
+            // Step 2: Compute Per-Tensor scale (global max / 448)
+            float k_scale_global = k_max_global / 448.0f;
+            float v_scale_global = v_max_global / 448.0f;
+            if (k_scale_global < 1e-6f) k_scale_global = 1.0f;
+            if (v_scale_global < 1e-6f) v_scale_global = 1.0f;
+
+            // Step 3: Broadcast scale to all heads
             for (int head = 0; head < num_kv_heads; ++head) {
-                std::vector<float> k_head_values, v_head_values;
+                h_k_scale[head] = k_scale_global;
+                h_v_scale[head] = v_scale_global;
+            }
 
-                // Collect all values for this head across all pages
-                for (size_t i = 0; i < k_size; ++i) {
-                    size_t page_idx = i / (num_kv_heads * 16 * head_dim);
-                    size_t head_in_page = (i / (16 * head_dim)) % num_kv_heads;
-                    if (head_in_page == static_cast<size_t>(head)) {
-                        k_head_values.push_back(h_k_float[i]);
-                    }
-                }
-                for (size_t i = 0; i < v_size; ++i) {
-                    size_t page_idx = i / (num_kv_heads * 16 * head_dim);
-                    size_t head_in_page = (i / (16 * head_dim)) % num_kv_heads;
-                    if (head_in_page == static_cast<size_t>(head)) {
-                        v_head_values.push_back(h_v_float[i]);
-                    }
-                }
-
-                // Compute scales
-                h_k_scale[head] = compute_quant_scale(k_head_values.data(), k_head_values.size());
-                h_v_scale[head] = compute_quant_scale(v_head_values.data(), v_head_values.size());
-
-                // Quantize K/V for this head
-                for (size_t i = 0; i < k_size; ++i) {
-                    size_t head_in_page = (i / (16 * head_dim)) % num_kv_heads;
-                    if (head_in_page == static_cast<size_t>(head)) {
-                        h_k_fp8[i] = float_to_fp8_e4m3_host(h_k_float[i] / h_k_scale[head]);
-                    }
-                }
-                for (size_t i = 0; i < v_size; ++i) {
-                    size_t head_in_page = (i / (16 * head_dim)) % num_kv_heads;
-                    if (head_in_page == static_cast<size_t>(head)) {
-                        h_v_fp8[i] = float_to_fp8_e4m3_host(h_v_float[i] / h_v_scale[head]);
-                    }
-                }
+            // Step 4: Quantize K/V using the same global scale
+            for (size_t i = 0; i < k_size; ++i) {
+                size_t head_in_page = (i / (16 * head_dim)) % num_kv_heads;
+                int head = static_cast<int>(head_in_page);
+                h_k_fp8[i] = float_to_fp8_e4m3_host(h_k_float[i] / k_scale_global);
+            }
+            for (size_t i = 0; i < v_size; ++i) {
+                size_t head_in_page = (i / (16 * head_dim)) % num_kv_heads;
+                int head = static_cast<int>(head_in_page);
+                h_v_fp8[i] = float_to_fp8_e4m3_host(h_v_float[i] / v_scale_global);
             }
         } else {
             // Simple version: data layout is [kv_len, num_kv_heads, head_dim]
             // idx = kv * num_kv_heads * head_dim + head * head_dim + d
+            // Use Per-Tensor scale (same as FlashInfer) for fair comparison
+
+            // Step 1: Find global maximum across all heads
+            float k_max_global = 0.0f;
+            float v_max_global = 0.0f;
+            for (size_t i = 0; i < k_size; ++i) {
+                k_max_global = fmax(k_max_global, fabsf(h_k_float[i]));
+            }
+            for (size_t i = 0; i < v_size; ++i) {
+                v_max_global = fmax(v_max_global, fabsf(h_v_float[i]));
+            }
+
+            // Step 2: Compute Per-Tensor scale (global max / 448)
+            float k_scale_global = k_max_global / 448.0f;
+            float v_scale_global = v_max_global / 448.0f;
+            if (k_scale_global < 1e-6f) k_scale_global = 1.0f;
+            if (v_scale_global < 1e-6f) v_scale_global = 1.0f;
+
+            // Step 3: Broadcast scale to all heads
             for (int head = 0; head < num_kv_heads; ++head) {
-                std::vector<float> k_head_values, v_head_values;
-                k_head_values.reserve(kv_len * head_dim);
-                v_head_values.reserve(kv_len * head_dim);
+                h_k_scale[head] = k_scale_global;
+                h_v_scale[head] = v_scale_global;
+            }
 
-                // Collect all values for this head
+            // Debug: print scale for head 0
+            if (verify) {
+                printf("Debug: Per-Tensor scale - k_scale=%.8f, v_scale=%.8f (global max: K=%.6f, V=%.6f)\n",
+                       k_scale_global, v_scale_global, k_max_global, v_max_global);
+                printf("  First 5 K values (head 0): ");
+                for (int d = 0; d < 5; ++d) {
+                    printf("%.4f ", h_k_float[d]);
+                }
+                printf("\n");
+
+                // Test FP8 conversion for first value
+                float test_val = -0.5f;
+                float test_normalized = test_val / k_scale_global;
+                uint8_t test_fp8 = float_to_fp8_e4m3_host(test_normalized);
+                printf("  FP8 test: val=%.4f -> normalized=%.4f -> fp8=0x%02x (scale=%.8f)\n",
+                       test_val, test_normalized, test_fp8, k_scale_global);
+            }
+
+            // Step 4: Quantize K/V using the same global scale
+            for (int head = 0; head < num_kv_heads; ++head) {
                 for (int kv = 0; kv < kv_len; ++kv) {
                     for (int d = 0; d < head_dim; ++d) {
                         size_t idx = kv * num_kv_heads * head_dim + head * head_dim + d;
-                        k_head_values.push_back(h_k_float[idx]);
-                        v_head_values.push_back(h_v_float[idx]);
-                    }
-                }
-
-                // Compute scales
-                h_k_scale[head] = compute_quant_scale(k_head_values.data(), k_head_values.size());
-                h_v_scale[head] = compute_quant_scale(v_head_values.data(), v_head_values.size());
-
-                // Debug: print scale for head 0
-                if (head == 0 && verify) {
-                    printf("Debug: head 0 - k_scale=%.6f, v_scale=%.6f\n", h_k_scale[head], h_v_scale[head]);
-                    printf("  First 5 K values: %.4f, %.4f, %.4f, %.4f, %.4f\n",
-                           k_head_values[0], k_head_values[1], k_head_values[2], k_head_values[3], k_head_values[4]);
-
-                    // Test FP8 conversion for first value
-                    float test_val = -0.5f;
-                    float test_normalized = test_val / h_k_scale[head];
-                    uint8_t test_fp8 = float_to_fp8_e4m3_host(test_normalized);
-                    printf("  FP8 test: val=%.4f -> normalized=%.4f -> fp8=0x%02x (scale=%.6f)\n",
-                           test_val, test_normalized, test_fp8, h_k_scale[head]);
-                }
-
-                // Quantize K/V for this head
-                for (int kv = 0; kv < kv_len; ++kv) {
-                    for (int d = 0; d < head_dim; ++d) {
-                        size_t idx = kv * num_kv_heads * head_dim + head * head_dim + d;
-                        h_k_fp8[idx] = float_to_fp8_e4m3_host(h_k_float[idx] / h_k_scale[head]);
-                        h_v_fp8[idx] = float_to_fp8_e4m3_host(h_v_float[idx] / h_v_scale[head]);
+                        h_k_fp8[idx] = float_to_fp8_e4m3_host(h_k_float[idx] / k_scale_global);
+                        h_v_fp8[idx] = float_to_fp8_e4m3_host(h_v_float[idx] / v_scale_global);
                     }
                 }
             }
@@ -1741,10 +1774,365 @@ void test_gqa_decode(
 }
 
 // ============================================================================
+// File I/O Functions for Direct Comparison
+// ============================================================================
+
+// Read binary file (FP16 format)
+template <typename T>
+bool read_binary_file(const std::string& filename, std::vector<T>& data) {
+    std::ifstream file(filename, std::ios::binary);
+    if (!file.is_open()) {
+        fprintf(stderr, "Error: Cannot open file for reading: %s\n", filename.c_str());
+        return false;
+    }
+
+    // Get file size
+    file.seekg(0, std::ios::end);
+    size_t file_size = file.tellg();
+    file.seekg(0, std::ios::beg);
+
+    // Resize vector
+    data.resize(file_size / sizeof(T));
+
+    // Read data
+    file.read(reinterpret_cast<char*>(data.data()), file_size);
+    if (!file) {
+        fprintf(stderr, "Error: Failed to read file: %s\n", filename.c_str());
+        return false;
+    }
+
+    file.close();
+    return true;
+}
+
+// Write binary file (FP16 format)
+template <typename T>
+bool write_binary_file(const std::string& filename, const std::vector<T>& data) {
+    std::ofstream file(filename, std::ios::binary);
+    if (!file.is_open()) {
+        fprintf(stderr, "Error: Cannot open file for writing: %s\n", filename.c_str());
+        return false;
+    }
+
+    file.write(reinterpret_cast<const char*>(data.data()), data.size() * sizeof(T));
+    if (!file) {
+        fprintf(stderr, "Error: Failed to write file: %s\n", filename.c_str());
+        return false;
+    }
+
+    file.close();
+    return true;
+}
+
+// Compare mode: run kernel with external input, write output to file
+// Supports reading pre-quantized FP8 data from PyTorch (when --fp8-data is specified)
+int run_compare_mode(
+    const std::string& q_file,
+    const std::string& k_file,
+    const std::string& v_file,
+    const std::string& output_file,
+    int num_qo_heads,
+    int num_kv_heads,
+    int head_dim,
+    int kv_len,
+    bool use_fp8,
+    const std::string& k_fp8_file = "",
+    const std::string& v_fp8_file = "",
+    float k_scale = 0.0f,
+    float v_scale = 0.0f
+) {
+    printf("\n");
+    printf("===============================================================\n");
+    printf("GQA Decode Compare Mode\n");
+    printf("===============================================================\n\n");
+
+    printf("Configuration:\n");
+    printf("  num_qo_heads: %d\n", num_qo_heads);
+    printf("  num_kv_heads: %d\n", num_kv_heads);
+    printf("  head_dim: %d\n", head_dim);
+    printf("  kv_len: %d\n", kv_len);
+    printf("  use_fp8: %s\n", use_fp8 ? "true" : "false");
+    printf("\n");
+
+    // Read input files
+    std::vector<__half> h_q, h_k, h_v;
+
+    printf("Reading input files...\n");
+    if (!read_binary_file(q_file, h_q)) {
+        fprintf(stderr, "Failed to read Q file: %s\n", q_file.c_str());
+        return 1;
+    }
+    if (!read_binary_file(k_file, h_k)) {
+        fprintf(stderr, "Failed to read K file: %s\n", k_file.c_str());
+        return 1;
+    }
+    if (!read_binary_file(v_file, h_v)) {
+        fprintf(stderr, "Failed to read V file: %s\n", v_file.c_str());
+        return 1;
+    }
+
+    // Validate sizes
+    size_t expected_q_size = num_qo_heads * head_dim;
+    size_t expected_kv_size = kv_len * num_kv_heads * head_dim;
+
+    if (h_q.size() != expected_q_size) {
+        fprintf(stderr, "Error: Q size mismatch. Expected %zu, got %zu\n",
+                expected_q_size, h_q.size());
+        return 1;
+    }
+    if (h_k.size() != expected_kv_size) {
+        fprintf(stderr, "Error: K size mismatch. Expected %zu, got %zu\n",
+                expected_kv_size, h_k.size());
+        return 1;
+    }
+    if (h_v.size() != expected_kv_size) {
+        fprintf(stderr, "Error: V size mismatch. Expected %zu, got %zu\n",
+                expected_kv_size, h_v.size());
+        return 1;
+    }
+
+    printf("  Q: %zu elements (%.2f MB)\n", h_q.size(), h_q.size() * sizeof(__half) / 1024.0 / 1024.0);
+    printf("  K: %zu elements (%.2f MB)\n", h_k.size(), h_k.size() * sizeof(__half) / 1024.0 / 1024.0);
+    printf("  V: %zu elements (%.2f MB)\n", h_v.size(), h_v.size() * sizeof(__half) / 1024.0 / 1024.0);
+    printf("\n");
+
+    // Allocate GPU memory
+    __half *d_q, *d_k, *d_v, *d_output;
+    uint8_t *d_k_fp8 = nullptr, *d_v_fp8 = nullptr;
+    float *d_k_scale = nullptr, *d_v_scale = nullptr;
+
+    size_t q_size = h_q.size();
+    size_t kv_size = h_k.size();
+    size_t output_size = num_qo_heads * head_dim;
+
+    CUDA_CHECK(cudaMalloc(&d_q, q_size * sizeof(__half)));
+    CUDA_CHECK(cudaMalloc(&d_k, kv_size * sizeof(__half)));
+    CUDA_CHECK(cudaMalloc(&d_v, kv_size * sizeof(__half)));
+    CUDA_CHECK(cudaMalloc(&d_output, output_size * sizeof(__half)));
+
+    // Copy input to GPU
+    CUDA_CHECK(cudaMemcpy(d_q, h_q.data(), q_size * sizeof(__half), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_k, h_k.data(), kv_size * sizeof(__half), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_v, h_v.data(), kv_size * sizeof(__half), cudaMemcpyHostToDevice));
+
+    // FP8 quantization if needed
+    if (use_fp8) {
+        // Check if pre-quantized FP8 data is provided (from PyTorch)
+        if (!k_fp8_file.empty() && !v_fp8_file.empty() && k_scale > 0.0f && v_scale > 0.0f) {
+            printf("Using pre-quantized FP8 data from PyTorch (CUDA 12.8 conversion)...\n");
+            printf("  K scale: %.8f, V scale: %.8f\n", k_scale, v_scale);
+
+            // Allocate FP8 memory
+            CUDA_CHECK(cudaMalloc(&d_k_fp8, kv_size * sizeof(uint8_t)));
+            CUDA_CHECK(cudaMalloc(&d_v_fp8, kv_size * sizeof(uint8_t)));
+            CUDA_CHECK(cudaMalloc(&d_k_scale, num_kv_heads * sizeof(float)));
+            CUDA_CHECK(cudaMalloc(&d_v_scale, num_kv_heads * sizeof(float)));
+
+            // Read pre-quantized FP8 data
+            std::vector<uint8_t> h_k_fp8(kv_size);
+            std::vector<uint8_t> h_v_fp8(kv_size);
+            
+            if (!read_binary_file(k_fp8_file, h_k_fp8)) {
+                fprintf(stderr, "Failed to read pre-quantized K FP8 file: %s\n", k_fp8_file.c_str());
+                return 1;
+            }
+            if (!read_binary_file(v_fp8_file, h_v_fp8)) {
+                fprintf(stderr, "Failed to read pre-quantized V FP8 file: %s\n", v_fp8_file.c_str());
+                return 1;
+            }
+
+            // Broadcast scales to all heads
+            std::vector<float> h_k_scale(num_kv_heads);
+            std::vector<float> h_v_scale(num_kv_heads);
+            for (int head = 0; head < num_kv_heads; ++head) {
+                h_k_scale[head] = k_scale;
+                h_v_scale[head] = v_scale;
+            }
+
+            // Copy to GPU
+            CUDA_CHECK(cudaMemcpy(d_k_fp8, h_k_fp8.data(), kv_size * sizeof(uint8_t), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_v_fp8, h_v_fp8.data(), kv_size * sizeof(uint8_t), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_k_scale, h_k_scale.data(), num_kv_heads * sizeof(float), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_v_scale, h_v_scale.data(), num_kv_heads * sizeof(float), cudaMemcpyHostToDevice));
+        } else {
+            printf("Performing FP8 quantization (Per-Tensor scale, matching FlashInfer)...\n");
+            printf("  Note: Using CUDA 12.8 runtime, conversion should match PyTorch\n");
+
+            // Allocate FP8 memory
+            CUDA_CHECK(cudaMalloc(&d_k_fp8, kv_size * sizeof(uint8_t)));
+            CUDA_CHECK(cudaMalloc(&d_v_fp8, kv_size * sizeof(uint8_t)));
+            CUDA_CHECK(cudaMalloc(&d_k_scale, num_kv_heads * sizeof(float)));
+            CUDA_CHECK(cudaMalloc(&d_v_scale, num_kv_heads * sizeof(float)));
+
+            // Compute Per-Tensor scales (global max, same as FlashInfer)
+            std::vector<float> h_k_scale(num_kv_heads);
+            std::vector<float> h_v_scale(num_kv_heads);
+
+            // Find global maximum for K and V
+            float k_max_global = 0.0f;
+            float v_max_global = 0.0f;
+            for (size_t i = 0; i < kv_size; ++i) {
+                k_max_global = fmax(k_max_global, fabsf(__half2float(h_k[i])));
+                v_max_global = fmax(v_max_global, fabsf(__half2float(h_v[i])));
+            }
+
+            // Per-Tensor scale: use global max (same as FlashInfer)
+            float k_scale = k_max_global / 448.0f;
+            float v_scale = v_max_global / 448.0f;
+            if (k_scale < 1e-6f) k_scale = 1.0f;
+            if (v_scale < 1e-6f) v_scale = 1.0f;
+
+            // All heads use the same scale (broadcast)
+            for (int head = 0; head < num_kv_heads; ++head) {
+                h_k_scale[head] = k_scale;
+                h_v_scale[head] = v_scale;
+            }
+
+            printf("  Global K max: %.6f, scale: %.8f\n", k_max_global, k_scale);
+            printf("  Global V max: %.6f, scale: %.8f\n", v_max_global, v_scale);
+
+            // Copy scales to GPU
+            CUDA_CHECK(cudaMemcpy(d_k_scale, h_k_scale.data(), num_kv_heads * sizeof(float), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_v_scale, h_v_scale.data(), num_kv_heads * sizeof(float), cudaMemcpyHostToDevice));
+
+            // Quantize K and V to FP8 using CUDA 12.8 conversion
+            // Note: Since we're using CUDA 12.8 runtime, this should match PyTorch's .to(float8_e4m3fn)
+            std::vector<uint8_t> h_k_fp8(kv_size);
+            std::vector<uint8_t> h_v_fp8(kv_size);
+
+            for (size_t i = 0; i < kv_size; ++i) {
+                int kv_head = (i % (num_kv_heads * head_dim)) / head_dim;
+                float k_val = __half2float(h_k[i]);
+                float v_val = __half2float(h_v[i]);
+                // Use the same scale for all heads (Per-Tensor)
+                // Using CUDA 12.8 runtime, conversion should match PyTorch
+                h_k_fp8[i] = float_to_fp8_e4m3_host(k_val / h_k_scale[kv_head]);
+                h_v_fp8[i] = float_to_fp8_e4m3_host(v_val / h_v_scale[kv_head]);
+            }
+
+            // Copy to GPU
+            CUDA_CHECK(cudaMemcpy(d_k_fp8, h_k_fp8.data(), kv_size * sizeof(uint8_t), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_v_fp8, h_v_fp8.data(), kv_size * sizeof(uint8_t), cudaMemcpyHostToDevice));
+        }
+
+        printf("  FP8 quantization complete\n\n");
+    }
+
+    // Choose kernel version
+    KernelVersion version = use_fp8 ? KernelVersion::FP8_SIMPLE : KernelVersion::SIMPLE;
+
+    // Launch kernel
+    printf("Running GQA decode kernel...\n");
+    cudaStream_t stream;
+    CUDA_CHECK(cudaStreamCreate(&stream));
+
+    if (use_fp8) {
+        gqa_decode_fp8_launch<__half>(
+            d_q, d_k_fp8, d_v_fp8, d_k_scale, d_v_scale, d_output,
+            num_qo_heads, num_kv_heads, head_dim, kv_len, 1,
+            nullptr, nullptr, 0,
+            version, 1.0f / sqrtf(float(head_dim)), stream
+        );
+    } else {
+        gqa_decode_launch<__half>(
+            d_q, d_k, d_v, d_output,
+            num_qo_heads, num_kv_heads, head_dim, kv_len, 1,
+            nullptr, nullptr, 0,
+            version, 1.0f / sqrtf(float(head_dim)), stream
+        );
+    }
+
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaStreamDestroy(stream));
+
+    printf("  Kernel execution complete\n\n");
+
+    // Copy output back to host
+    std::vector<__half> h_output(output_size);
+    CUDA_CHECK(cudaMemcpy(h_output.data(), d_output, output_size * sizeof(__half), cudaMemcpyDeviceToHost));
+
+    // Write output to file
+    printf("Writing output to file: %s\n", output_file.c_str());
+    if (!write_binary_file(output_file, h_output)) {
+        fprintf(stderr, "Failed to write output file\n");
+        return 1;
+    }
+
+    printf("  Output: %zu elements (%.2f MB)\n", h_output.size(), h_output.size() * sizeof(__half) / 1024.0 / 1024.0);
+    printf("\n");
+
+    // Print sample output
+    printf("Sample output (first 8 values of head 0):\n");
+    for (int i = 0; i < std::min(8, head_dim); ++i) {
+        printf("  [%d] %.6f\n", i, __half2float(h_output[i]));
+    }
+    printf("\n");
+
+    // Cleanup
+    CUDA_CHECK(cudaFree(d_q));
+    CUDA_CHECK(cudaFree(d_k));
+    CUDA_CHECK(cudaFree(d_v));
+    CUDA_CHECK(cudaFree(d_output));
+    if (use_fp8) {
+        CUDA_CHECK(cudaFree(d_k_fp8));
+        CUDA_CHECK(cudaFree(d_v_fp8));
+        CUDA_CHECK(cudaFree(d_k_scale));
+        CUDA_CHECK(cudaFree(d_v_scale));
+    }
+
+    printf("===============================================================\n");
+    printf("Compare mode completed successfully!\n");
+    printf("===============================================================\n\n");
+
+    return 0;
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
 int main(int argc, char** argv) {
+    // Check for compare mode first
+    if (argc > 1 && std::string(argv[1]) == "compare") {
+        // Compare mode: ./gqa_decode compare q.bin k.bin v.bin output.bin QO KV D L [--fp8]
+        if (argc < 10) {
+            fprintf(stderr, "Usage: %s compare <q.bin> <k.bin> <v.bin> <output.bin> <num_qo_heads> <num_kv_heads> <head_dim> <kv_len> [--fp8]\n", argv[0]);
+            fprintf(stderr, "\n");
+            fprintf(stderr, "Example:\n");
+            fprintf(stderr, "  %s compare q.bin k.bin v.bin output.bin 32 8 128 128\n", argv[0]);
+            fprintf(stderr, "  %s compare q.bin k.bin v.bin output.bin 32 8 128 128 --fp8\n", argv[0]);
+            return 1;
+        }
+
+        std::string q_file = argv[2];
+        std::string k_file = argv[3];
+        std::string v_file = argv[4];
+        std::string output_file = argv[5];
+        int num_qo_heads = std::atoi(argv[6]);
+        int num_kv_heads = std::atoi(argv[7]);
+        int head_dim = std::atoi(argv[8]);
+        int kv_len = std::atoi(argv[9]);
+        bool use_fp8 = (argc > 10 && std::string(argv[10]) == "--fp8");
+
+        // Parse optional FP8 data arguments
+        std::string k_fp8_file, v_fp8_file;
+        float k_scale = 0.0f, v_scale = 0.0f;
+        
+        for (int i = 10; i < argc; ++i) {
+            if (std::string(argv[i]) == "--fp8-data" && i + 4 < argc) {
+                k_fp8_file = argv[++i];
+                v_fp8_file = argv[++i];
+                k_scale = std::atof(argv[++i]);
+                v_scale = std::atof(argv[++i]);
+            }
+        }
+
+        return run_compare_mode(q_file, k_file, v_file, output_file,
+                               num_qo_heads, num_kv_heads, head_dim, kv_len, use_fp8,
+                               k_fp8_file, v_fp8_file, k_scale, v_scale);
+    }
+
+    // Normal test mode
     printf("\n");
     printf("===============================================================\n");
     printf("GQA Decode Standalone Implementation Test\n");
@@ -1770,6 +2158,19 @@ int main(int argc, char** argv) {
             version = KernelVersion::FP8_PAGED;
             use_fp8 = true;
             printf("Using FP8 KV cache version (paged)\n");
+        } else if (arg == "--help" || arg == "-h") {
+            printf("Usage:\n");
+            printf("  Test mode:\n");
+            printf("    %s [simple|paged|fp8|fp8_paged]\n", argv[0]);
+            printf("\n");
+            printf("  Compare mode (for direct numerical comparison with FlashInfer):\n");
+            printf("    %s compare <q.bin> <k.bin> <v.bin> <output.bin> <num_qo_heads> <num_kv_heads> <head_dim> <kv_len> [--fp8]\n", argv[0]);
+            printf("\n");
+            printf("Examples:\n");
+            printf("  %s fp8           # Run FP8 tests\n", argv[0]);
+            printf("  %s compare q.bin k.bin v.bin out.bin 32 8 128 128\n", argv[0]);
+            printf("  %s compare q.bin k.bin v.bin out.bin 32 8 128 128 --fp8\n", argv[0]);
+            return 0;
         } else {
             printf("Using SIMPLE (contiguous) KV cache version\n");
         }

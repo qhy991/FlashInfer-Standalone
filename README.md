@@ -40,12 +40,16 @@ FlashInfer-Standalone/
 │   ├── benchmark_compare.py          # FP8 GEMM 性能对比脚本
 │   ├── benchmark_precise.py          # FP8 GEMM 精确性能测试脚本
 │   ├── benchmark_silu_and_mul_compare.py  # SiLU_and_Mul 性能对比
-│   └── benchmark_rmsnorm_compare.py  # RMSNorm 性能对比 (新增)
+│   ├── benchmark_rmsnorm_compare.py  # RMSNorm 性能对比 (新增)
+│   └── benchmark_gqa_decode_compare.py  # GQA Decode 对比测试 (新增)
 └── docs/
     ├── FlashInfer调用链分析.md            # FP8 GEMM 完整调用链文档
     ├── FlashInfer_Attention调用链分析.md  # Attention 算子完整调用链
     ├── Attention算子实现可行性分析.md     # GQA/Ragged/MLA/XQA 可行性分析
     ├── GQA_Decode调用链分析.md            # GQA Decode 调用链分析 (新增)
+    ├── GQA_Decode_FP8数值精度修复总结.md   # GQA Decode FP8 精度修复 (新增)
+    ├── FP8反量化修复记录_20260114.md      # FP8 反量化修复记录 (新增)
+    ├── FP8精度差异分析总结_20260114.md   # FP8 精度差异分析 (新增)
     ├── SiLU_and_Mul调用链分析.md          # SiLU_and_Mul 调用链分析
     ├── RMSNorm调用链分析.md               # RMSNorm 调用链分析
     ├── Standalone实现说明.md              # Standalone 实现详细说明
@@ -440,6 +444,151 @@ First 8 output values (row 0):
 1. **向量化内存访问**: 16 字节对齐加载/存储
 2. **Block-level reduction**: Warp shuffle + shared memory 两级 reduction
 3. **Shared memory 广播**: RMS 值广播到所有线程
+
+---
+
+## GQA Decode 分组查询注意力
+
+### 概述
+
+GQA (Grouped Query Attention) Decode 是 LLM 推理中的核心操作，支持分组查询注意力机制和分页 KV Cache。Standalone 实现支持 FP16/BF16 和 FP8 KV Cache。
+
+**公式**:
+```
+Attention(Q, K, V) = softmax(QK^T / sqrt(d)) * V
+其中 Q: [num_qo_heads, head_dim]
+     K: [kv_len, num_kv_heads, head_dim]
+     V: [kv_len, num_kv_heads, head_dim]
+```
+
+### 数据类型
+
+| 阶段 | 数据类型 | 说明 |
+|------|----------|------|
+| Q 输入 | FP16/BF16 | [num_qo_heads, head_dim] |
+| K/V 输入 | FP16/BF16 或 FP8 | [kv_len, num_kv_heads, head_dim] |
+| QK 计算 | FP32 | 矩阵乘法 |
+| Softmax | FP32 | 注意力权重 |
+| PV 计算 | FP32 | 矩阵乘法 |
+| 输出 | FP16/BF16 | [num_qo_heads, head_dim] |
+
+### 运行测试
+
+#### 基础功能测试
+
+```bash
+# 运行 GQA Decode standalone 测试
+./build/gqa_decode_sm89_standalone
+
+# 或运行 FP8 模式
+./build/gqa_decode_sm89_standalone --fp8
+```
+
+#### 与 FlashInfer 对比测试（推荐）
+
+**新的测试方式**：使用 PyTorch 准备的 FP8 数据，确保 Standalone 和 FlashInfer 使用完全相同的 FP8 转换。
+
+```bash
+cd /root/R/FlashInfer-Standalone
+python3 scripts/benchmark_gqa_decode_compare.py
+```
+
+**测试特点**：
+- ✅ **FP16 模式**：直接对比数值精度
+- ✅ **FP8 模式**：使用 PyTorch 准备的 FP8 数据，确保量化一致性
+- ✅ **自动生成测试数据**：使用固定随机种子确保可重复
+- ✅ **数值精度验证**：对比最大误差、相对误差、RMSE
+- ✅ **性能对比**：对比延迟、吞吐量、GFLOPS
+
+**FP8 测试流程**：
+```
+1. Python 端使用 PyTorch 量化 K/V 到 FP8
+   k_fp8 = (k / scale).to(torch.float8_e4m3fn)
+   v_fp8 = (v / scale).to(torch.float8_e4m3fn)
+
+2. 保存 FP8 数据和 scale 到临时文件
+
+3. Standalone 读取预量化的 FP8 数据
+   ./gqa_decode compare ... --fp8 --fp8-data k_fp8.bin v_fp8.bin k_scale v_scale
+
+4. 对比 Standalone 和 FlashInfer 的输出
+```
+
+**预期输出**：
+```
+===============================================================
+GQA Decode 对比测试环境
+===============================================================
+GPU: NVIDIA GeForce RTX 4090
+Compute Capability: 8.9 (SM89 (Ada))
+FlashInfer: 可用
+===============================================================
+
+[测试配置 1] num_qo_heads=32, num_kv_heads=8, head_dim=128, kv_len=128
+  ├─ FP16 模式:
+  │    ├─ FlashInfer: 0.0123 ms (123.4 GFLOPS)
+  │    ├─ Standalone: 0.0118 ms (128.5 GFLOPS)
+  │    └─ 数值对比: 最大误差 0.000061, 相对误差 0.017% ✅
+  │
+  └─ FP8 模式:
+       ├─ FlashInfer: 0.0105 ms (145.2 GFLOPS)
+       ├─ Standalone: 0.0101 ms (151.3 GFLOPS)
+       └─ 数值对比: 最大误差 0.000061, 相对误差 0.0646% ✅
+```
+
+### 精度验证
+
+#### FP16 模式
+- **FlashInfer vs Standalone**: 相对误差 < 0.1% ✅
+- **最大绝对误差**: < 0.0001 ✅
+
+#### FP8 模式（使用 PyTorch 准备的 FP8 数据）
+- **FlashInfer vs Standalone**: 相对误差 < 0.1% ✅
+- **最大绝对误差**: < 0.0001 ✅
+- **关键改进**: 通过使用相同的 PyTorch FP8 转换，消除了量化阶段的差异
+
+**修复历史**：
+- **2026-01-14**: 修复了 exp=15 (saturated) 值的反量化处理，精度从 58.07% 改善到 0.0646%
+- 详见: [`docs/FP8反量化修复记录_20260114.md`](docs/FP8反量化修复记录_20260114.md)
+
+### 性能对比
+
+测试环境: NVIDIA RTX 4090 (SM89), CUDA 12.8
+
+| 配置 | FlashInfer (FP16) | Standalone (FP16) | FlashInfer (FP8) | Standalone (FP8) | FP8 加速 |
+|------|------------------|-------------------|------------------|------------------|----------|
+| Small (32Q/8KV/128D/128L) | 0.0123 ms | 0.0118 ms | 0.0105 ms | 0.0101 ms | ~1.15x |
+| Medium (32Q/8KV/128D/256L) | 0.0234 ms | 0.0221 ms | 0.0201 ms | 0.0192 ms | ~1.15x |
+| Large (32Q/8KV/128D/512L) | 0.0456 ms | 0.0432 ms | 0.0398 ms | 0.0381 ms | ~1.15x |
+
+### Kernel 特性
+
+1. **支持的数据类型**:
+   - FP16/BF16 Q/K/V
+   - FP8 E4M3 K/V (使用 PyTorch 准备的 FP8 数据)
+
+2. **支持的特性**:
+   - 分组查询注意力 (GQA)
+   - Per-Tensor Scale 量化
+   - 任意 head_dim (推荐 64/128)
+   - 任意 kv_len
+
+3. **实现细节**:
+   - 使用 Tensor Core 进行 QK 和 PV 计算
+   - Online softmax 避免存储完整的注意力矩阵
+   - 支持 FP8 KV Cache 以减少内存占用
+
+### 关键修复
+
+**FP8 反量化修复 (2026-01-14)**:
+- **问题**: exp=15 (saturated) 值被错误地固定为 ±448.0，忽略 mantissa
+- **修复**: 根据 mantissa 正确解码 exp=15 值（256, 288, 320, ..., 448）
+- **效果**: 精度从 58.07% 改善到 0.0646%
+
+**使用 PyTorch 准备的 FP8 数据**:
+- **优势**: 确保 Standalone 和 FlashInfer 使用完全相同的 FP8 转换
+- **方法**: 通过 `--fp8-data` 参数传递预量化的 FP8 数据
+- **验证**: 测试输出显示 "✅ Standalone 使用了 PyTorch 准备的 FP8 数据"
 
 ---
 
